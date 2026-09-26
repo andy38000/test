@@ -43,8 +43,8 @@ python3 cursor_mode_switch.py status
 
 字段是 `useOpenAIKey`，对应设置里的 “Use OpenAI API Key”。依据是 Cursor 3.22.7 的界面代码。打开数据库时按 SQLite 的正常方式读取，因此会带上旁边的 `-wal`。
 
-- `local`：把 `useOpenAIKey` 设为 `true`，继续用已经保存的 Key 和 Base URL。
-- `grok`：把 `useOpenAIKey` 设为 `false`，避免 Grok 4.7 / Composer 报 “This model does not support custom API keys”。
+- `local`：把 `useOpenAIKey` 设为 `true`。如果数据库里的 Base URL 是空的，并且旁边的暂存文件里有地址，就把它写回去。如果数据库里已经有地址，就保留，并刷新暂存文件。
+- `grok`：把 `useOpenAIKey` 设为 `false`。如果 `openAIBaseUrl` 不是空字符串，先把地址抄到数据库旁边的 `cursor-mode-switch-baseurl.json`（仅当前用户可读），再把字段设成 `null`（和 Cursor 关掉 “Override OpenAI Base URL” 时一样）。暂存失败就不会清空地址。这样 Grok 4.7 / Composer 不再因为自定义 Key / Base URL 报 “This model does not support custom API keys”，地址也不会丢。
 
 写入前，会把 `state.vscdb` 以及存在的 `state.vscdb-wal`、`state.vscdb-shm` 复制到脚本旁边的 `backups/年月日-时分秒/`。已有备份不会被覆盖。命令会打印这个备份目录。输出里不会打印 API Key、token，也不会打印带账号密码的 Base URL。
 
@@ -59,16 +59,14 @@ python3 cursor_mode_switch.py status
 ## 它不改什么
 
 - 不删除、不改写已保存的 API Key（`cursorAuth/openAIKey` 或加密行 `secret://cursorAuth/openAIKey`）。
-- 不删除、不改写 `openAIBaseUrl` 这串地址。
 - 不改模型列表里的开/关。那些开关和上面的报错无关。
 - 不切换当前模型。`deepseek-v4-flash-vision-exp` 和 Grok 4.7 都不会写进去。
 - 不能在 Cursor 设置页面里加按钮。
+- 不会打印 API Key 或 Base URL。`status` 只报告 Base URL 是否已设置（yes/no），以及是否有暂存地址（yes/no）。
 
-### 为什么不关 “Override OpenAI Base URL”
+### Override OpenAI Base URL
 
-这个开关没有单独的布尔字段。界面是否打开，只看 `openAIBaseUrl` 是不是非空字符串。关掉它时，Cursor 会把该字段写成 `null`，已保存的地址就没了。本工具要留下这串地址，所以不动它。
-
-切到 `grok` 之后，如果原来保存过地址，设置里的 Override 开关仍会显示为开。`useOpenAIKey` 关掉后，通常就不会再报 “does not support custom API keys”。如果请求仍被送到自定义地址，需要在设置里手动关掉 Override（这会清空地址；可以先用备份找回）。
+这个开关没有单独的布尔字段。只要 `openAIBaseUrl` 是非空字符串，界面就是开的。`grok` 会先把地址写到 `state.vscdb` 同目录的 `cursor-mode-switch-baseurl.json`（不在 git 仓库里，权限只有当前用户），再把数据库里的字段设为 `null`。`local` 会在数据库地址为空时，从这份暂存里把地址放回去。暂存文件写失败时，不会清空数据库里的地址。
 
 ### 为什么不改模型
 

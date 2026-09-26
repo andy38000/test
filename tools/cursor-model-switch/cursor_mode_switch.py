@@ -8,14 +8,13 @@ Verified against the Cursor 3.22.7 workbench (linux x64 build
   ``applicationUser`` reactive-storage JSON in ``state.vscdb``.
 - "Override OpenAI Base URL" is not a boolean. The checkbox is on when
   ``openAIBaseUrl`` is a non-empty string. Turning it off sets that field
-  to null, which deletes the saved URL. This tool does not touch it.
+  to null. ``grok`` copies a non-empty value into a user-only sidecar next
+  to ``state.vscdb`` and then sets null. ``local`` restores it from that
+  sidecar when the database value is empty.
 - The key string lives in other rows (``cursorAuth/openAIKey`` or
   ``secret://cursorAuth/openAIKey``). This tool does not read or write them.
 
-Model selection is ``aiSettings.modelConfig.<surface>.modelName`` plus
-``selectedModels[].modelId`` and model-specific ``parameters``. Cursor 3.22.7
-does not hard-code a Grok 4.7 id (the bundled id is grok-4.6). This tool
-does not write a model id.
+Model selection is not written.
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ import platform
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from datetime import datetime
@@ -38,6 +38,7 @@ APPLICATION_USER_KEY = (
 )
 FLAG = "useOpenAIKey"
 MODES = {"local": True, "grok": False}
+STASH_NAME = "cursor-mode-switch-baseurl.json"
 
 _SECRET_RE = re.compile(
     r"sk-[A-Za-z0-9_\-]{8,}"
@@ -256,30 +257,91 @@ def flag_value(parsed):
     return None
 
 
-def describe_base_url(parsed) -> str:
-    if not isinstance(parsed, dict) or "openAIBaseUrl" not in parsed:
-        return "openAIBaseUrl: 字段不存在（未改动）"
-    value = parsed.get("openAIBaseUrl")
-    if value is None or value == "":
-        return "openAIBaseUrl: 未设置（界面上的 Override 开关为关，内容不显示）"
-    if isinstance(value, str) and value.strip() == "":
-        return "openAIBaseUrl: 只有空白（未改动，内容不显示）"
-    if isinstance(value, str):
-        return "openAIBaseUrl: 已保存（未改动，内容不显示）。界面上的 Override 开关会显示为开。"
-    return "openAIBaseUrl: 类型不是字符串（未改动，内容不显示）"
+def url_is_set(value) -> bool:
+    """True when Cursor's override checkbox would be on (non-empty string)."""
+    return isinstance(value, str) and len(value) > 0
 
 
-def format_known_status(parsed) -> str:
+def stash_path_for(db_path: Path) -> Path:
+    return db_path.parent / STASH_NAME
+
+
+def read_stashed_url(path: Path):
+    """Return the stashed URL, or None. Never raises for a missing or bad file."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("openAIBaseUrl")
+    if url_is_set(value):
+        return value
+    return None
+
+
+def _restrict_user_only(path: Path) -> None:
+    if os.name == "nt":
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    else:
+        os.chmod(path, 0o600)
+
+
+def save_baseurl_stash(path: Path, url: str) -> None:
+    """Write the URL to a user-only JSON file. Raise OSError on failure."""
+    if not url_is_set(url):
+        raise ValueError("refusing to stash an empty base URL")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"openAIBaseUrl": url}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    except Exception:
+        os.close(fd)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    try:
+        _restrict_user_only(temporary)
+        os.replace(temporary, path)
+        _restrict_user_only(path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def format_url_lines(parsed, db_path: Path) -> str:
+    value = parsed.get("openAIBaseUrl") if isinstance(parsed, dict) else None
+    stashed = read_stashed_url(stash_path_for(db_path))
+    return "Base URL 已设置: %s\n已暂存 Base URL: %s" % (
+        "yes" if url_is_set(value) else "no",
+        "yes" if stashed else "no",
+    )
+
+
+def format_known_status(parsed, db_path: Path) -> str:
     lines = [
         "useOpenAIKey: %s" % ("true" if flag_value(parsed) else "false"),
-        describe_base_url(parsed),
+        format_url_lines(parsed, db_path),
         "API Key 字符串: 未读取、未修改",
-        "模型: 未修改（deepseek-v4-flash-vision-exp 与 Grok 4.7 都没有安全可写的字段）",
+        "模型: 未修改（不写模型选择）",
     ]
     return "\n".join(lines)
 
 
-def format_unknown_status(parsed) -> str:
+def format_unknown_status(parsed, db_path: Path) -> str:
     names = matching_bool_names(parsed) if isinstance(parsed, (dict, list)) else []
     lines = [
         "未找到布尔字段 useOpenAIKey。未写入。",
@@ -289,6 +351,7 @@ def format_unknown_status(parsed) -> str:
         lines.extend(names)
     else:
         lines.append("（无）")
+    lines.append(format_url_lines(parsed, db_path))
     return "\n".join(lines)
 
 
@@ -325,8 +388,16 @@ def backup_database(db_path: Path, backup_root: Path) -> Path:
     return dest
 
 
-def write_flag(db_path: Path, desired: bool) -> bool:
-    """Set useOpenAIKey. Return False when the verified flag is gone. No other fields change."""
+def apply_switch(db_path: Path, desired_flag: bool, clear_url: bool, restore_url) -> str:
+    """Update the flag and, when requested, the base URL.
+
+    ``clear_url`` sets ``openAIBaseUrl`` to null only when the current value is
+    a non-empty string that is already in the sidecar. ``restore_url`` is
+    written only when the database value is empty. A URL that is not already
+    in the sidecar is never cleared.
+
+    Returns ``ok``, ``missing``, or ``refused``.
+    """
     conn = sqlite3.connect(db_path, timeout=5)
     conn.isolation_level = None
     try:
@@ -337,13 +408,22 @@ def write_flag(db_path: Path, desired: bool) -> bool:
         ).fetchone()
         if row is None:
             conn.execute("ROLLBACK")
-            return False
+            return "missing"
         text, was_bytes = decode_value(row[0])
         parsed = json.loads(text)
         if flag_value(parsed) is None:
             conn.execute("ROLLBACK")
-            return False
-        parsed[FLAG] = desired
+            return "missing"
+        current = parsed.get("openAIBaseUrl")
+        if clear_url and url_is_set(current):
+            stashed = read_stashed_url(stash_path_for(db_path))
+            if stashed != current:
+                conn.execute("ROLLBACK")
+                return "refused"
+            parsed["openAIBaseUrl"] = None
+        elif url_is_set(restore_url) and not url_is_set(current):
+            parsed["openAIBaseUrl"] = restore_url
+        parsed[FLAG] = bool(desired_flag)
         new_text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
         payload = new_text.encode("utf-8") if was_bytes else new_text
         conn.execute(
@@ -351,7 +431,7 @@ def write_flag(db_path: Path, desired: bool) -> bool:
             (payload, APPLICATION_USER_KEY),
         )
         conn.execute("COMMIT")
-        return True
+        return "ok"
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -382,10 +462,34 @@ def run_status(db_path: Path) -> int:
         emit("无法打开数据库。若 Cursor 正在运行，请先完全退出后再试。", sys.stderr)
         return 1
     if flag_value(parsed) is None:
-        emit(format_unknown_status(parsed))
+        emit(format_unknown_status(parsed, db_path))
         return 0
-    emit(format_known_status(parsed))
+    emit(format_known_status(parsed, db_path))
     return 0
+
+
+def _emit_result(db_path: Path, before_flag: bool, backup) -> None:
+    _text, parsed, _was_bytes = load_application_user(db_path)
+    after_flag = flag_value(parsed)
+    emit(
+        "useOpenAIKey: %s -> %s"
+        % ("true" if before_flag else "false", "true" if after_flag else "false")
+    )
+    emit(format_url_lines(parsed, db_path))
+    emit("API Key 字符串: 未修改")
+    emit("模型: 未修改")
+    if backup is not None:
+        emit("备份: %s" % backup)
+
+
+def _try_stash(db_path: Path, url: str) -> bool:
+    """Copy ``url`` to the sidecar. Return False when the saved text cannot be read back."""
+    path = stash_path_for(db_path)
+    try:
+        save_baseurl_stash(path, url)
+    except (OSError, ValueError):
+        return False
+    return read_stashed_url(path) == url
 
 
 def run_switch(mode: str, db_path: Path, backup_root: Path) -> int:
@@ -404,39 +508,65 @@ def run_switch(mode: str, db_path: Path, backup_root: Path) -> int:
         return 1
 
     if flag_value(parsed) is None:
-        emit(format_unknown_status(parsed), sys.stderr)
+        emit(format_unknown_status(parsed, db_path), sys.stderr)
         return 1
 
-    current = flag_value(parsed)
-    if current == desired:
-        emit("useOpenAIKey 已经是 %s，未写入。" % ("true" if desired else "false"))
-        emit(describe_base_url(parsed))
-        emit("模型: 未修改")
-        return 0
+    current_flag = flag_value(parsed)
+    current_url = parsed.get("openAIBaseUrl")
+    url_set = url_is_set(current_url)
+    stashed = read_stashed_url(stash_path_for(db_path))
+    restore_url = None
+    clear_url = False
 
-    if not assert_cursor_quit():
-        return 1
+    if mode == "grok":
+        clear_url = url_set
+        needs_db = (current_flag is not False) or clear_url
+        if not needs_db:
+            emit("useOpenAIKey 已经是 false，Base URL 未设置，未写入。")
+            emit(format_url_lines(parsed, db_path))
+            emit("模型: 未修改")
+            return 0
+        if not assert_cursor_quit():
+            return 1
+        if clear_url and not _try_stash(db_path, current_url):
+            emit("暂存 Base URL 失败，未清空该字段，未写入数据库。", sys.stderr)
+            return 1
+    else:
+        if url_set:
+            if not _try_stash(db_path, current_url):
+                emit("暂存 Base URL 失败，数据库中的地址未删除。", sys.stderr)
+                if current_flag is True:
+                    return 1
+        elif url_is_set(stashed):
+            restore_url = stashed
+        needs_db = (current_flag is not True) or (restore_url is not None)
+        if not needs_db:
+            emit("useOpenAIKey 已经是 true，未写入数据库。")
+            emit(format_url_lines(parsed, db_path))
+            emit("模型: 未修改")
+            return 0
+        if not assert_cursor_quit():
+            return 1
 
     try:
         backup = backup_database(db_path, backup_root)
-    except OSError as exc:
-        emit("备份失败（%s），未写入。" % type(exc).__name__, sys.stderr)
+    except OSError:
+        emit("备份失败，未写入。", sys.stderr)
         return 1
 
     try:
-        wrote = write_flag(db_path, desired)
+        result = apply_switch(db_path, desired, clear_url, restore_url)
     except (sqlite3.Error, json.JSONDecodeError, TypeError, UnicodeError):
         emit("写入失败。数据库应未被提交修改。备份: %s" % backup, sys.stderr)
         return 1
-    if not wrote:
+    if result == "refused":
+        emit("Base URL 尚未确认写入暂存文件，未清空该字段。备份: %s" % backup, sys.stderr)
+        return 1
+    if result != "ok":
         emit("写入前 useOpenAIKey 已不存在，已回滚。备份: %s" % backup, sys.stderr)
         return 1
 
-    emit("useOpenAIKey: %s -> %s" % ("true" if current else "false", "true" if desired else "false"))
-    emit(describe_base_url(parsed))
-    emit("API Key 字符串: 未修改")
-    emit("模型: 未修改（未能安全切换 deepseek-v4-flash-vision-exp 或 Grok 4.7）")
-    emit("备份: %s" % backup)
+    _emit_result(db_path, current_flag, backup)
     return 0
 
 
